@@ -8,6 +8,14 @@ from TTS.tts.configs.xtts_config import XttsConfig
 from TTS.tts.models.xtts import Xtts
 import io
 import wave
+from pydub import AudioSegment
+import librosa
+import pyrubberband
+import soundfile as sf
+from datetime import datetime
+import random
+import string
+import re
 
 ##########################
 #### Webserver Imports####
@@ -38,6 +46,7 @@ with open(this_dir / "languages.json", encoding="utf8") as f:
     languages = json.load(f)
 # Base setting for a possible FineTuned model existing and the loader being available
 tts_method_xtts_ft = False
+
 
 #################################################################
 #### LOAD PARAMS FROM confignew.json - REQUIRED FOR BRANDING ####
@@ -485,7 +494,17 @@ async def generate_audio(text, voice, language, temperature, repetition_penalty,
         return response
     async for _ in response:
         pass
-    
+
+async def generate_audio_local(text, voices, weights, language, temperature, repetition_penalty, output_file, streaming=False, speed=1.0, pitch=0):
+    # Get the async generator from the internal function
+    response = generate_audio_local_internal(text, voices, weights, language, temperature, repetition_penalty, output_file, streaming, speed, pitch)
+    # If streaming, then return the generator as-is, otherwise just exhaust it and return
+    if streaming:
+        return response
+    async for _ in response:
+        pass
+
+
 async def generate_audio_internal(text, voice, language, temperature, repetition_penalty, output_file, streaming):
     global model
     if params["low_vram"] and device == "cpu":
@@ -596,6 +615,151 @@ async def generate_audio_internal(text, voice, language, temperature, repetition
         await switch_device()
     return
 
+async def generate_audio_local_internal(text, voices, weights, language, temperature, repetition_penalty, output_file, streaming, speed, pitch):
+    global model
+    if params["low_vram"] and device == "cpu":
+        await switch_device()
+    generate_start_time = time.time()  # Record the start time of generating TTS
+    
+    # XTTSv2 LOCAL & Xttsv2 FT Method
+    if params["tts_method_xtts_local"] or tts_method_xtts_ft:
+        print(f"[{params['branding']}TTSGen] {text}")
+
+        #读取角色信息，加权求和再平均得到目标音色变量（weighted_gpt_cond_latent, weighted_speaker_embedding）
+        with open(this_dir / "data.json", 'r') as file:
+            information = json.load(file)
+            gpt_cond_latents = []
+            speaker_embeddings = []
+            for i in range(len(voices)):
+                gpt_cond_latent, speaker_embedding = information[voices[i]]["gpt_cond_latent"], information[voices[i]]["speaker_embedding"]
+                gpt_cond_latent, speaker_embedding = torch.tensor(gpt_cond_latent).to(device), torch.tensor(speaker_embedding).to(device)
+                gpt_cond_latents.append(gpt_cond_latent)
+                speaker_embeddings.append(speaker_embedding)
+            weighted_speaker_embeddings = [speaker_embedding * weight for speaker_embedding, weight in zip(speaker_embeddings, weights)]
+            weighted_gpt_cond_latents = [gpt_cond_latent * weight for gpt_cond_latent, weight in zip(gpt_cond_latents, weights)]
+            weighted_speaker_embedding = torch.mean(torch.stack(weighted_speaker_embeddings), dim=0)
+            weighted_gpt_cond_latent = torch.mean(torch.stack(weighted_gpt_cond_latents), dim=0)
+
+
+        # Common arguments for both functions
+        common_args = {
+            "text": text,
+            "language": language,
+            "gpt_cond_latent": weighted_gpt_cond_latent,
+            "speaker_embedding": weighted_speaker_embedding,
+            "temperature": float(temperature),
+            "length_penalty": float(model.config.length_penalty),
+            "repetition_penalty": float(repetition_penalty),
+            "top_k": int(model.config.top_k),
+            "top_p": float(model.config.top_p),
+            "enable_text_splitting": True,
+            "speed": speed
+        }
+
+        # Determine the correct inference function and add streaming specific argument if needed
+        inference_func = model.inference_stream if streaming else model.inference
+        if streaming:
+            common_args["stream_chunk_size"] = 20
+
+        # Call the appropriate function
+        output = inference_func(**common_args)
+
+        # Process the output based on streaming or non-streaming
+        if streaming:
+            # Streaming-specific operations
+            file_chunks = []
+            wav_buf = io.BytesIO()
+            with wave.open(wav_buf, "wb") as vfout:
+                vfout.setnchannels(1)
+                vfout.setsampwidth(2)
+                vfout.setframerate(24000)
+                vfout.writeframes(b"")
+            wav_buf.seek(0)
+            yield wav_buf.read()
+
+            for i, chunk in enumerate(output):
+                file_chunks.append(chunk)
+                if isinstance(chunk, list):
+                    chunk = torch.cat(chunk, dim=0)
+                chunk = chunk.clone().detach().cpu().numpy()
+                chunk = chunk[None, : int(chunk.shape[0])]
+                chunk = np.clip(chunk, -1, 1)
+                chunk = (chunk * 32767).astype(np.int16)
+                yield chunk.tobytes()
+        else:
+            # Non-streaming-specific operation
+            torchaudio.save(output_file, torch.tensor(output["wav"]).unsqueeze(0), 24000)
+            if pitch != 0:
+
+                #读取音频文件，调用pydub库
+                #根据音调变化改变采样率
+                audio = AudioSegment.from_wav(output_file)
+                octaves = pitch / 12
+                new_sample_rate = int(audio.frame_rate * (2 ** octaves))
+                hipitched_sound = audio._spawn(audio.raw_data, overrides={'frame_rate': new_sample_rate})
+                hipitched_sound = hipitched_sound.set_frame_rate(audio.frame_rate)
+                speed = hipitched_sound.duration_seconds/ audio.duration_seconds
+                hipitched_sound.export(output_file, format="wav")
+
+                #调用pyrubberband库
+                #将音调改变的文件改回原来的时长
+                y, sr = librosa.load(output_file, sr=None)
+                y_stretched = pyrubberband.time_stretch(y, sr, speed)
+                sf.write(output_file, y_stretched, sr, format='wav')
+
+
+
+    
+    # API LOCAL Methods
+    elif params["tts_method_api_local"]:
+        # Streaming only allowed for XTTSv2 local
+        if streaming:
+            raise ValueError("Streaming is only supported in XTTSv2 local")
+
+        # Set the correct output path (different from the if statement)
+        print(f"[{params['branding']}TTSGen] Using API Local")
+        model.tts_to_file(
+            text=text,
+            file_path=output_file,
+            speaker_wav=[f"{this_dir}/voices/{voice}"],
+            language=language,
+            temperature=temperature,
+            length_penalty=model.config.length_penalty,
+            repetition_penalty=repetition_penalty,
+            top_k=model.config.top_k,
+            top_p=model.config.top_p,
+        )
+
+    # API TTS
+    elif params["tts_method_api_tts"]:
+        # Streaming only allowed for XTTSv2 local
+        if streaming:
+            raise ValueError("Streaming is only supported in XTTSv2 local")
+
+        print(f"[{params['branding']}TTSGen] Using API TTS")
+        model.tts_to_file(
+            text=text,
+            file_path=output_file,
+            speaker_wav=[f"{this_dir}/voices/{voice}"],
+            language=language,
+        )
+
+    # Print Generation time and settings
+    generate_end_time = time.time()  # Record the end time to generate TTS
+    generate_elapsed_time = generate_end_time - generate_start_time
+    print(
+        f"[{params['branding']}TTSGen] \033[93m{generate_elapsed_time:.2f} seconds. \033[94mLowVRAM: \033[33m{params['low_vram']} \033[94mDeepSpeed: \033[33m{params['deepspeed_activate']}\033[0m"
+    )
+    # Move model back to cpu system ram if needed.
+    if params["low_vram"] and device == "cuda":
+        await switch_device()
+    return
+
+
+
+
+
+
 
 # TTS VOICE GENERATION METHODS - generate TTS API
 @app.route("/api/generate", methods=["POST"])
@@ -616,6 +780,61 @@ async def generate(request: Request):
             return StreamingResponse(response, media_type="audio/wav")
         return JSONResponse(
             content={"status": "generate-success", "data": {"audio_path": output_file}}
+        )
+    except Exception as e:
+        return JSONResponse(content={"status": "error", "message": str(e)})
+
+def extract_and_concatenate_quoted_text(text):
+    """
+    提取字符串中所有双引号内的文本并拼接，如果没有双引号内的文本，则返回原文。
+    参数:
+    text (str): 需要处理的文本。
+    返回:
+    str: 拼接后的双引号内文本或原文。
+    """
+    matches = re.findall(r'"(.*?)"', text)
+    if matches:
+        # 如果找到双引号内的文本，则将它们拼接起来
+        return ' '.join(matches)
+    else:
+        # 如果没有找到双引号内的文本，返回原文
+        return text
+    
+@app.route("/api/generate_local", methods=["POST"])
+async def generate_local(request: Request):
+    try:
+        # Get parameters from JSON body
+        data = await request.json()
+        text = extract_and_concatenate_quoted_text(data["text"])
+        voices = data["voices"]
+        weights = data["weights"]
+        if len(voices) != len(weights):
+            raise ValueError("Weights doesn't match the number of voices for weighted average.")
+        language = "en"     #data["language"]
+        temperature = 0.75  #data["temperature"]
+        repetition_penalty = 10 #data["repetition_penalty"]
+
+        now = datetime.now()
+        date_string = now.strftime("%Y-%m-%d")
+        characters = string.ascii_letters + string.digits
+        folder_path = this_dir / "outputs" # + date_string
+        if not os.path.exists(folder_path):
+            os.makedirs(folder_path)
+
+        random_string = ''.join(random.choice(characters) for i in range(32))
+        filename = "{}.wav".format(random_string)
+        output_file = "{}/{}".format(folder_path, filename)
+
+        # output_file = data["output_file"]
+        streaming = False
+        speed = data["speed"]
+        pitch = data["pitch"]
+        # Generation logic
+        response = await generate_audio_local(text, voices, weights, language, temperature, repetition_penalty, output_file, streaming, speed, pitch)
+        if streaming:
+            return StreamingResponse(response, media_type="audio/wav")
+        return JSONResponse(
+            content={"status": "generate-success", "data": {"audio_path": filename}}
         )
     except Exception as e:
         return JSONResponse(content={"status": "error", "message": str(e)})
