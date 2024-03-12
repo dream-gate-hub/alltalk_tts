@@ -705,7 +705,7 @@ async def generate_audio_local_internal(text, voices, weights, language, tempera
                 #将音调改变的文件改回原来的时长
                 y, sr = librosa.load(output_file, sr=None)
                 y_stretched = pyrubberband.time_stretch(y, sr, speed)
-                sf.write(output_file, y_stretched, sr, format='wav')
+                sf.write(output_file, y_stretched, sr, format='mp3')
 
 
 
