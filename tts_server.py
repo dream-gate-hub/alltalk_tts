@@ -902,8 +902,10 @@ async def generate_local(request: Request):
 
         # output_file = data["output_file"]
         streaming = False
-        speed = data["speed"]
         pitch = data["pitch"]
+        speed = data["speed"]
+        if speed == 0:
+            speed = 1
         # Generation logic
         print("voices:{}, weights:{}, language:{}, speed:{}, pitch:{}".format(voices, weights, language, speed, pitch))
         response = await generate_audio_local(text, voices, weights, language, temperature, repetition_penalty, output_file, streaming, speed, pitch)
@@ -926,6 +928,9 @@ async def generate_reference(file: UploadFile = File(...), text: str = Form(...)
         temperature = 0.75  #data["temperature"]
         repetition_penalty = 10 #data["repetition_penalty"]
         streaming = False
+        
+        if speed == 0:
+            speed = 1
 
         now = datetime.now()
         date_string = now.strftime("%Y-%m-%d")
@@ -946,7 +951,7 @@ async def generate_reference(file: UploadFile = File(...), text: str = Form(...)
         with open(temp_file_path, 'wb') as temp_file:
             content = await file.read()
             temp_file.write(content)
-          
+        
         # Generation logic
         response = await generate_audio(text, temp_file_name, language, temperature, repetition_penalty, output_file, streaming, speed, pitch)
         if streaming:
