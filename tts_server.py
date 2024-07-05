@@ -18,6 +18,7 @@ import string
 import re
 import whisper
 import asyncio
+import pyrubberband
 
 ##########################
 #### Webserver Imports####
@@ -37,6 +38,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
+
+from urllib.parse import urlparse
+import requests
+from urllib.parse import unquote
+import httpx
+import shutil
 
 ###########################
 #### STARTUP VARIABLES ####
@@ -338,6 +345,24 @@ async def handle_tts_method_change(tts_method):
     await setup()
 
 
+def check_or_download_voice(voice_url: string):
+    local_voice_dir = "./voices/"
+    filename = os.path.basename(urlparse(voice_url).path)
+    local_voice_path = os.path.join(local_voice_dir, filename)
+    
+    if os.path.exists(local_voice_path):
+        return os.path.abspath(local_voice_path)
+    else:
+        print(f"Downloading voice file from {voice_url}...")
+        os.makedirs(local_voice_dir, exist_ok=True)
+        response = requests.get(voice_url)
+        with open(local_voice_path, "wb") as f:
+            f.write(response.content)
+        print(f"Voice file downloaded and saved to {local_voice_path}")
+        return os.path.abspath(local_voice_path)
+
+
+
 # MODEL WEBSERVER- API Swap Between Models
 @app.route("/api/reload", methods=["POST"])
 async def reload(request: Request):
@@ -513,6 +538,15 @@ async def generate_audio_local(text, voices, weights, language, temperature, rep
     async for _ in response:
         pass
 
+async def generate_audio_v1(text, voices, weights, language, temperature, repetition_penalty, output_file, streaming=False, speed=1.0, pitch=0):
+    # Get the async generator from the internal function
+    response = generate_audio_internal_v1(text, voices, weights, language, temperature, repetition_penalty, output_file, streaming, speed, pitch)
+    # If streaming, then return the generator as-is, otherwise just exhaust it and return
+    if streaming:
+        return response
+    async for _ in response:
+        pass
+
 async def generate_audio_internal(text, voice, language, temperature, repetition_penalty, output_file, streaming, speed=1.0, pitch=0):
     global model
     if params["low_vram"] and device == "cpu":
@@ -596,7 +630,8 @@ async def generate_audio_internal(text, voice, language, temperature, repetition
                 AudioSegment.from_wav(wav_output_file).export(output_file, format="mp3")
 
 
-        
+
+
 
     
     # API LOCAL Methods
@@ -803,6 +838,202 @@ async def generate_audio_local_internal(text, voices, weights, language, tempera
     return
 
 
+
+async def generate_audio_internal_v1(text, voices, weights, language, temperature, repetition_penalty, output_file, streaming, speed, pitch):
+    global model
+    if params["low_vram"] and device == "cpu":
+        await switch_device()
+    generate_start_time = time.time()  # Record the start time of generating TTS
+    
+    # XTTSv2 LOCAL & Xttsv2 FT Method
+    if params["tts_method_xtts_local"] or tts_method_xtts_ft:
+        print(f"[{params['branding']}TTSGen] {text}")
+
+        #加权求和再平均得到目标音色变量（weighted_gpt_cond_latent, weighted_speaker_embedding）
+        gpt_cond_latents = []
+        speaker_embeddings = []
+        for voice_url in voices:
+            voice = check_or_download_voice(voice_url)
+            gpt_cond_latent, speaker_embedding = model.get_conditioning_latents(
+                audio_path=[voice],
+                gpt_cond_len=model.config.gpt_cond_len,
+                max_ref_length=model.config.max_ref_len,
+                sound_norm_refs=model.config.sound_norm_refs,
+            )
+
+            gpt_cond_latent, speaker_embedding = torch.tensor(gpt_cond_latent).to(device), torch.tensor(speaker_embedding).to(device)
+            gpt_cond_latents.append(gpt_cond_latent)
+            speaker_embeddings.append(speaker_embedding)
+
+        weighted_speaker_embeddings = [speaker_embedding * weight for speaker_embedding, weight in zip(speaker_embeddings, weights)]
+        weighted_gpt_cond_latents = [gpt_cond_latent * weight for gpt_cond_latent, weight in zip(gpt_cond_latents, weights)]
+        weighted_speaker_embedding = torch.mean(torch.stack(weighted_speaker_embeddings), dim=0)
+        weighted_gpt_cond_latent = torch.mean(torch.stack(weighted_gpt_cond_latents), dim=0)    
+
+        # Common arguments for both functions
+        common_args = {
+            "text": text,
+            "language": language,
+            "gpt_cond_latent": weighted_gpt_cond_latent,
+            "speaker_embedding": weighted_speaker_embedding,
+            "temperature": float(temperature),
+            "length_penalty": float(model.config.length_penalty),
+            "repetition_penalty": float(repetition_penalty),
+            "top_k": int(model.config.top_k),
+            "top_p": float(model.config.top_p),
+            "enable_text_splitting": True,
+            "speed": speed
+        }
+
+
+        # print(f"[{params['branding']}TTSGen] {text}")
+        # gpt_cond_latent, speaker_embedding = model.get_conditioning_latents(
+        #     audio_path=[f"{this_dir}/voices/{voices[0]}"],
+        #     gpt_cond_len=model.config.gpt_cond_len,
+        #     max_ref_length=model.config.max_ref_len,
+        #     sound_norm_refs=model.config.sound_norm_refs,
+        # )
+
+        # # Common arguments for both functions
+        # common_args = {
+        #     "text": text,
+        #     "language": language,
+        #     "gpt_cond_latent": gpt_cond_latent,
+        #     "speaker_embedding": speaker_embedding,
+        #     "temperature": float(temperature),
+        #     "length_penalty": float(model.config.length_penalty),
+        #     "repetition_penalty": float(repetition_penalty),
+        #     "top_k": int(model.config.top_k),
+        #     "top_p": float(model.config.top_p),
+        #     "enable_text_splitting": True,
+        #     "speed": speed
+        # }
+
+        # Determine the correct inference function and add streaming specific argument if needed
+        inference_func = model.inference_stream if streaming else model.inference
+        if streaming:
+            common_args["stream_chunk_size"] = 20
+
+        # Call the appropriate function
+        output = inference_func(**common_args)
+
+        # Process the output based on streaming or non-streaming
+        if streaming:
+            # Streaming-specific operations
+            file_chunks = []
+            wav_buf = io.BytesIO()
+            with wave.open(wav_buf, "wb") as vfout:
+                vfout.setnchannels(1)
+                vfout.setsampwidth(2)
+                vfout.setframerate(24000)
+                vfout.writeframes(b"")
+            wav_buf.seek(0)
+            yield wav_buf.read()
+
+            for i, chunk in enumerate(output):
+                file_chunks.append(chunk)
+                if isinstance(chunk, list):
+                    chunk = torch.cat(chunk, dim=0)
+                chunk = chunk.clone().detach().cpu().numpy()
+                chunk = chunk[None, : int(chunk.shape[0])]
+                chunk = np.clip(chunk, -1, 1)
+                chunk = (chunk * 32767).astype(np.int16)
+                yield chunk.tobytes()
+        else:
+            # Non-streaming-specific operation
+            wav_output_file = output_file.replace('mp3', 'wav')
+            torchaudio.save(wav_output_file, torch.tensor(output["wav"]).unsqueeze(0), 24000)
+            if pitch != 0:
+                #最初版本，没有升降速
+                                
+                # audio = AudioSegment.from_wav(wav_output_file)
+                # octaves = pitch / 12
+                # new_sample_rate = int(audio.frame_rate * (2 ** octaves))
+                # hipitched_sound = audio._spawn(audio.raw_data, overrides={'frame_rate': new_sample_rate})
+                # hipitched_sound = hipitched_sound.set_frame_rate(24000)  # 假设您想要的最终采样率是24000Hz
+
+                # # 直接导出为MP3，不需要转回WAV然后再到MP3
+                # hipitched_sound.export(output_file, format="mp3")
+                
+
+                #lhr版本，根据pitch自适应升降速，保持语音时长不变
+                
+                speed = 1 / (2 ** (pitch / 12))
+                # 读取MP3文件并转换为WAV格式
+                audio = AudioSegment.from_wav(wav_output_file)
+                octaves = pitch / 12
+                new_sample_rate = int(audio.frame_rate * (2 ** octaves))
+                hipitched_sound = audio._spawn(audio.raw_data, overrides={'frame_rate': new_sample_rate})
+                hipitched_sound = hipitched_sound.set_frame_rate(24000)  # 设置最终采样率为24000Hz
+
+                # 使用pyrubberband处理时间拉伸
+                y, sr = librosa.load(hipitched_sound.export(format="wav"), sr=None)
+                y_stretched = pyrubberband.time_stretch(y, sr, speed)
+                # 直接导出为MP3，不需要转回WAV然后再到MP3
+                # hipitched_sound.export(output_file, format="mp3")
+                # y_stretched.export(output_file, format="mp3")
+                # 保存处理后的音频为MP3
+                sf.write(output_file, y_stretched, sr, format='wav')
+                final_audio = AudioSegment.from_wav(output_file)
+                final_audio.export(output_file, format="mp3")
+
+
+                
+            else:
+                AudioSegment.from_wav(wav_output_file).export(output_file, format="mp3")
+
+
+
+    
+    # API LOCAL Methods
+    elif params["tts_method_api_local"]:
+        # Streaming only allowed for XTTSv2 local
+        if streaming:
+            raise ValueError("Streaming is only supported in XTTSv2 local")
+
+    
+
+        # Set the correct output path (different from the if statement)
+        print(f"[{params['branding']}TTSGen] Using API Local")
+        model.tts_to_file(
+            text=text,
+            file_path=output_file,
+            speaker_wav=[f"{this_dir}/voices/{voice}"],
+            language=language,
+            temperature=temperature,
+            length_penalty=model.config.length_penalty,
+            repetition_penalty=repetition_penalty,
+            top_k=model.config.top_k,
+            top_p=model.config.top_p,
+        )
+
+    # API TTS
+    elif params["tts_method_api_tts"]:
+        # Streaming only allowed for XTTSv2 local
+        if streaming:
+            raise ValueError("Streaming is only supported in XTTSv2 local")
+
+        print(f"[{params['branding']}TTSGen] Using API TTS")
+        model.tts_to_file(
+            text=text,
+            file_path=output_file,
+            speaker_wav=[f"{this_dir}/voices/{voice}"],
+            language=language,
+        )
+
+    # Print Generation time and settings
+    generate_end_time = time.time()  # Record the end time to generate TTS
+    generate_elapsed_time = generate_end_time - generate_start_time
+    print(
+        f"[{params['branding']}TTSGen] \033[93m{generate_elapsed_time:.2f} seconds. \033[94mLowVRAM: \033[33m{params['low_vram']} \033[94mDeepSpeed: \033[33m{params['deepspeed_activate']}\033[0m"
+    )
+    # Move model back to cpu system ram if needed.
+    if params["low_vram"] and device == "cuda":
+        await switch_device()
+    return
+
+
+
 # TTS VOICE GENERATION METHODS - generate TTS API
 @app.route("/api/generate", methods=["POST"])
 async def generate(request: Request):
@@ -920,40 +1151,42 @@ async def generate_local(request: Request):
 
 # TTS VOICE GENERATION METHODS - generate TTS API
     
-@app.post("/api/generate_reference")
-async def generate_reference(file: UploadFile = File(...), text: str = Form(...), speed: float = Form(...), pitch: float = Form(...)):
+@app.route("/api/v1/tts", methods=["POST"])
+async def generate_v1(request: Request):
     try:
         # Get parameters from JSON body
+        data = await request.json()
+        text = data["text"]
+        voices = data["voices"]
+        weights = data["weights"]
+        if len(voices) != len(weights):
+            raise ValueError("Weights doesn't match the number of voices for weighted average.")
         language = "en"     #data["language"]
         temperature = 0.75  #data["temperature"]
         repetition_penalty = 10 #data["repetition_penalty"]
-        streaming = False
-        
-        if speed == 0:
-            speed = 1
 
         now = datetime.now()
         date_string = now.strftime("%Y-%m-%d")
         characters = string.ascii_letters + string.digits
         folder_path = this_dir / "outputs" # + date_string
-        print(folder_path)
         if not os.path.exists(folder_path):
             os.makedirs(folder_path)
 
         random_string = ''.join(random.choice(characters) for i in range(32))
         filename = "{}.mp3".format(random_string)
-        output_file = "{}/{}.mp3".format(folder_path, filename)
-        
+        output_file = "{}/{}".format(folder_path, filename)
+
         clean_old_files(folder_path, 10)
 
-        temp_file_name = f"temp_{file.filename}"
-        temp_file_path = f"{this_dir}/voices/{temp_file_name}"
-        with open(temp_file_path, 'wb') as temp_file:
-            content = await file.read()
-            temp_file.write(content)
-        
+        # output_file = data["output_file"]
+        streaming = False
+        pitch = data["pitch"]
+        speed = data["speed"]
+        if speed == 0:
+            speed = 1
         # Generation logic
-        response = await generate_audio(text, temp_file_name, language, temperature, repetition_penalty, output_file, streaming, speed, pitch)
+        print("voices:{}, weights:{}, language:{}, speed:{}, pitch:{}".format(voices, weights, language, speed, pitch))
+        response = await generate_audio_v1(text, voices, weights, language, temperature, repetition_penalty, output_file, streaming, speed, pitch)
         if streaming:
             return StreamingResponse(response, media_type="audio/wav")
         return JSONResponse(
@@ -961,6 +1194,85 @@ async def generate_reference(file: UploadFile = File(...), text: str = Form(...)
         )
     except Exception as e:
         return JSONResponse(content={"status": "error", "message": str(e)})
+
+
+@app.route("/api/v2/tts", methods=["POST"])
+async def generate_v2(request: Request):
+    data = await request.json()
+
+    # Extract fields from the data
+    voice = data.get("voice")
+    prompt_text = data.get("prompt_text")
+    text = data.get("text")
+    gpt_model = data.get("gpt_model")
+    sovits_model = data.get("sovits_model")
+    
+    # Prepare the payload for the forwarding request
+    payload = {
+        "voice": voice,
+        "prompt_text": prompt_text,
+        "text": text,
+        "gpt_model": gpt_model,
+        "sovits_model": sovits_model,
+        "output_directory": f"{this_dir}/outputs/"
+    }
+    
+    try:
+        # Forward the request to the other endpoint with increased timeout
+        async with httpx.AsyncClient(timeout=60.0) as client:  # Set timeout to 30 seconds
+            response = await client.post("http://127.0.0.1:9880", json=payload)
+            response.raise_for_status()  # Raise an exception for HTTP errors
+
+        # Return the response from the forwarded request as JSON
+        return JSONResponse(status_code=response.status_code, content=response.json())
+
+    except httpx.RequestError as exc:
+        # Handle request errors, including timeout
+        raise HTTPException(status_code=500, detail=str(exc))
+    except httpx.HTTPStatusError as exc:
+        # Handle HTTP errors
+        raise HTTPException(status_code=exc.response.status_code, detail=exc.response.text)
+
+
+@app.route("/api/v2/training", methods=["POST"])
+async def training_v2(request: Request):
+    data = await request.json()
+    
+    # Prepare the payload for the forwarding request
+    payload = {
+        "voice": data.get("voice"),
+        "name": data.get("name")
+    }
+
+    try:
+        # Forward the request to the other endpoint with increased timeout
+        async with httpx.AsyncClient(timeout=300.0) as client:  # Set timeout to 30 seconds
+            response = await client.post("http://127.0.0.1:9880/training", json=payload)
+            response.raise_for_status()  # Raise an exception for HTTP errors
+            response_data = response.json()
+
+            folder_path = this_dir / "outputs" # + date_string
+            if not os.path.exists(folder_path):
+                os.makedirs(folder_path)
+                
+            filename = f"{int(time.time())}_{uuid.uuid4().hex}.mp3"
+            output_file = "{}/{}".format(folder_path, filename)
+
+            voice_ref = response_data["data"]["voice_ref"]
+            shutil.copy(voice_ref, output_file)
+
+            response_data["data"]["voice_ref"] = filename
+
+        # Return the response from the forwarded request as JSON
+        return JSONResponse(status_code=response.status_code, content=response_data)
+
+    except httpx.RequestError as exc:
+        # Handle request errors, including timeout
+        raise HTTPException(status_code=500, detail=str(exc))
+    except httpx.HTTPStatusError as exc:
+        # Handle HTTP errors
+        raise HTTPException(status_code=exc.response.status_code, detail=exc.response.text)
+
 
 ###################################################
 #### POPULATE FILES LIST FROM VOICES DIRECTORY ####
